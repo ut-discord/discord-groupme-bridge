@@ -152,8 +152,7 @@ discordClient.once('ready', async () => {
             if (!webhook) {
                 console.log("Creating webhook for channel #"+channel.name);
                 await channel.createWebhook({
-                    name: 'discord-groupme-bridge',
-                    avatar: 'https://groupme.com/about',
+                    name: 'discord-groupme-bridge'
                 })
                 webhooks = await channel.fetchWebhooks();
                 webhook = webhooks.find(wh => wh.token);
