@@ -60,3 +60,5 @@ typings/
 # Bot Config Files
 bridgeBot.yml
 /.vs
+
+bridgeBot.yml

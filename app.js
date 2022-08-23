@@ -1,5 +1,6 @@
 // Imports -----------------------------------------------------------------------------------------------------------------
 const Discord = require("discord.js");
+const { Client, IntentsBitField, Partials, WebhookClient } = require('discord.js');
 const YAML = require("yamljs");
 const request = require("request-promise");
 const express = require("express");
@@ -13,20 +14,29 @@ const process = require("process");
 
 // Config and functions -----------------------------------------------------------------------------------------------------------------
 const defaultConfig = {
-    listenPort: 8088,
+    listenPort: 80,
     callbackURL: "/callback",
     discord: {
-        username: "my-bot",
         token: "",
-        guild: "0",
-        channel: "0"
+        guild: "0"
     },
     groupme: {
-        name: "",
-        botId: "",
         accessToken: ""
-    }
+    },
+    links: [
+        {
+            discord: {
+                channel: "0"
+            },
+            groupme: {
+                name: "",
+                botId: ""
+            }
+        }
+    ]
 };
+
+
 var config;
 var tempDir = path.join(os.tmpdir(), "groupme-discord-bridge");
 
@@ -39,12 +49,12 @@ function download(url, filename, callback) {
     });
 }
 
-function sendGroupMeMessage(message, attachments, callback) {
+function sendGroupMeMessage(message, attachments, callback, botId) {
     let options = {
         method: 'POST',
         uri: 'https://api.groupme.com/v3/bots/post',
         body: {
-            bot_id: config.groupme.botId,
+            bot_id: botId,
             text: message
         },
         json: true
@@ -58,6 +68,39 @@ function sendGroupMeMessage(message, attachments, callback) {
         callback(res);
     }).catch((err) => {
         console.error(err);
+    });
+}
+
+
+function getGroupMeBots() {
+    let options = {
+        method: 'GET',
+        uri: 'https://api.groupme.com/v3/bots',
+        headers: {
+            "X-Access-Token": config.groupme.accessToken
+        },
+        json: true
+    };
+
+    request(options).then((res) => {
+        let bots = res.response;
+        for(let i = 0; i < bots.length; i++) {
+            let link = config.links.findIndex(x => x.groupme.botId === bots[i].bot_id);
+            if(link < 0) continue;
+            
+            config.links[link].groupme.groupId = bots[i].group_id;
+            config.links[link].groupme.name = bots[i].name;
+        }
+    }).catch((err) => {
+        console.error(err);
+    });
+}
+
+function sendDiscordMessage(message, sender, avatar_url, link, attachments) {
+    link.discord.webhook.send({
+        content: message,
+        username: sender,
+        avatarURL: avatar_url,
     });
 }
 
@@ -79,40 +122,58 @@ try {
     process.exit(1);
 }
 
-const discordClient = new Discord.Client();
+getGroupMeBots();
+
+const myIntents = new IntentsBitField([IntentsBitField.Flags.Guilds, IntentsBitField.Flags.DirectMessages, IntentsBitField.Flags.GuildPresences, IntentsBitField.Flags.GuildMembers, IntentsBitField.Flags.GuildMessages, IntentsBitField.Flags.MessageContent]);
+const discordClient = new Discord.Client(
+    {
+         intents: myIntents,
+         partials: [Partials.Message, Partials.Channel, Partials.Reaction]
+    });
+
 const expressApp = express();
 expressApp.use(bodyParser.json());
 var discordGuild;
-var discordChannel;
+
 
 discordClient.on("ready", () => {
     console.log("Discord Client Ready.");
-    discordGuild = discordClient.guilds.get(config.discord.guild);
-    discordChannel = discordGuild.channels.get(config.discord.channel);
+    discordGuild = discordClient.guilds.cache.get(config.discord.guild);
 });
 
-discordClient.on("presenceUpdate", (oldMember, newMember) => {
-    let author = oldMember.nickname == null ? oldMember.user.username : oldMember.nickname;
 
-    if(oldMember.presence.game == null && newMember.presence.game != null) {
-        if(newMember.presence.game.streaming) {
-            sendGroupMeMessage(author + " is now streaming at " + newMember.presence.game.url, null, () => {});
-        }
-    }
+discordClient.once('ready', async () => {
+    for(let i = 0; i < config.links.length; i++) {
+        const channel = discordClient.channels.cache.get(config.links[i].discord.channel);
+        try {
+            let webhooks = await channel.fetchWebhooks();
+            let webhook = webhooks.find(wh => wh.token);
 
-    if(oldMember.presence.game != null && newMember.presence.game != null) {
-        if(oldMember.presence.game.streaming && !newMember.presence.game.streaming) {
-            sendGroupMeMessage(author + " has stopped streaming", null, () => {});
-        } else if(!oldMember.presence.game.streaming && newMember.presence.game.streaming){
-            sendGroupMeMessage(author + " is now streaming at " + newMember.presence.game.url, null, () => {});
+            if (!webhook) {
+                console.log("Creating webhook for channel #"+channel.name);
+                await channel.createWebhook({
+                    name: 'discord-groupme-bridge',
+                    avatar: 'https://groupme.com/about',
+                })
+                webhooks = await channel.fetchWebhooks();
+                webhook = webhooks.find(wh => wh.token);
+            }
+
+            config.links[i].discord.webhook = webhook;
+
+        } catch (error) {
+            console.error('Error fetching webhooks');
         }
     }
 });
 
-discordClient.on("message", (message) => {
-    if(message.author.username === config.discord.username) return;
-    if(message.channel.id !== config.discord.channel) return;
+
+discordClient.on("messageCreate", async (message) => {
+    if(message.webhookId) return;
     if((message.content == null || message.content == "") && message.attachments.size == 0) return;
+
+    let link = config.links.find(x => x.discord.channel === message.channelId);
+    if(!link) return;
 
     let author = message.member.nickname == null ? message.author.username : message.member.nickname;
 
@@ -139,12 +200,14 @@ discordClient.on("message", (message) => {
             });
         });
     } else {
-        sendGroupMeMessage(author + ": " + message.cleanContent, null, () => {});
+        sendGroupMeMessage(author + ": " + message.cleanContent, null, () => {}, link.groupme.botId);
     }
 });
 
 expressApp.post(config.callbackURL, (req, res) => {
-    if(req.body.name == config.groupme.name) return;
+    let link = config.links.find(x => x.groupme.groupId === req.body.group_id);;
+    if(!link) return;
+    if(req.body.name == link.groupme.name) return;
 
     var text = req.body.text;
     var sender = req.body.name;
@@ -176,13 +239,18 @@ expressApp.post(config.callbackURL, (req, res) => {
 					});
 				});
 				break;
+            case "reply":
+                // TODO: Handle replies
+                break;
 			default:
 				console.log("Unknown attachment: " + attachments[0].type);
 		}
     } else {
-        discordChannel.send("**" + sender + "**: " + text);
+      sendDiscordMessage(text, sender, req.body.avatar_url, link);
     }
 });
+
+
 
 discordClient.login(config.discord.token);
 expressApp.listen(config.listenPort, () => console.log('Express now listening for requests'));
